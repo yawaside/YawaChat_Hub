@@ -1,0 +1,232 @@
+name: build · tag · release
+
+# Полный конвейер релизной линии:
+#   1. push в main / тег v* / ручной запуск  →  АВТОСБОРКА portable exe + установщика
+#   2. после успешной сборки                 →  АВТОТЕГ (1.0.0, затем 1.0.1, 1.0.2...)
+#   3. после тега                            →  АВТОРЕЛИЗ с ченжлогом и exe
+#
+# VERSION задаёт версию следующего релиза. Каждый сегмент minor и patch —
+# одна цифра 0…9, поэтому счёт идёт 1.0.0 → 1.0.1 → … → 1.0.9 → 1.1.0 → …
+# → 1.9.9 → 2.0.0. Перенос считает scripts/bump-version.mjs; после релиза
+# workflow сам записывает в VERSION следующую версию.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза (по умолчанию — из файла VERSION)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yawachat-release
+  cancel-in-progress: false
+
+jobs:
+  # ───────────────────────────── 1. СБОРКА ─────────────────────────────
+  build:
+    name: Сборка exe
+    runs-on: windows-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      next: ${{ steps.ver.outputs.next }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Определить версию
+        id: ver
+        shell: bash
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            V="$(tr -d '[:space:]' < VERSION)"
+            LATEST="$(git tag --list "v*" --sort=-v:refname | head -n 1)"
+            if [ -n "$LATEST" ]; then
+              # Следующая версия по схеме переноса: 1.0.9 → 1.1.0, 1.9.9 → 2.0.0.
+              CANDIDATE="$(node scripts/bump-version.mjs "${LATEST#v}")"
+              if [ "$(printf '%s\n%s\n' "$CANDIDATE" "$V" | sort -V | tail -n 1)" = "$CANDIDATE" ]; then
+                V="$CANDIDATE"
+              fi
+            fi
+          fi
+          node scripts/bump-version.mjs --check "$V"
+          # Версия приложения обязана совпадать с версией релиза: иначе в exe
+          # и в окне «О программе» окажется не тот номер, что в теге.
+          node scripts/bump-version.mjs --set "$V"
+          node scripts/bump-version.mjs --verify
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "next=$(node scripts/bump-version.mjs "$V")" >> "$GITHUB_OUTPUT"
+          echo "Собираем YawaChatHub $V"
+
+      # 1. Собираем интерфейс (он же рендерер приложения).
+      #    `npm run build` — это сайт на Next.js; рендерер для Electron
+      #    собирает Vite: `npm run build:renderer` → dist/index.html (single-file).
+      - name: Build renderer (Vite)
+        shell: bash
+        env:
+          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          npm install
+          npm run build:renderer
+          test -d dist
+          mkdir -p desktop/renderer-dist
+          cp -r dist/. desktop/renderer-dist/
+
+      # 2. Собираем portable exe + NSIS-установщик.
+      #    ВАЖНО: в desktop/package.json выставлено "npmRebuild": false —
+      #    иначе @electron/rebuild пытается собрать bufferutil (опциональное
+      #    ускорение ws) через node-gyp и падает без Visual Studio.
+      - name: Установить зависимости desktop
+        shell: bash
+        run: |
+          cd desktop
+          npm install
+
+      # Иконки exe/ярлыка/установщика (desktop/build) и иконки рантайма
+      # (desktop/electron/assets — они попадают в asar и рисуют значок в трее).
+      # Скрипт на чистом Node: одинаковый результат в CI и локально.
+      # Файлы лежат и в репозитории, поэтому сбой генерации не ломает сборку.
+      - name: Подготовить иконки (ICO + PNG)
+        continue-on-error: true
+        run: node scripts/prepare-icon.mjs
+
+      - name: electron-builder (portable + nsis)
+        working-directory: desktop
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win --publish never
+
+      - name: Выложить артефакты
+        uses: actions/upload-artifact@v4
+        with:
+          name: YawaChatHub-${{ steps.ver.outputs.version }}
+          path: |
+            desktop/release/YawaChatHub.exe
+            desktop/release/YawaChatHub-Setup.exe
+            desktop/release/latest.yml
+          if-no-files-found: warn
+
+  # ───────────────────────────── 2. АВТОТЕГ ────────────────────────────
+  tag:
+    name: Автотег
+    needs: build
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Создать тег ${{ needs.build.outputs.tag }}
+        shell: bash
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Тег $TAG уже существует — пропускаем создание"
+            exit 0
+          fi
+          git tag -a "$TAG" -m "YawaChatHub v$VERSION — portable exe + installer"
+          git push origin "$TAG"
+          echo "Создан тег $TAG"
+
+  # ──────────────────────────── 3. АВТОРЕЛИЗ ───────────────────────────
+  release:
+    name: Авторелиз + ченжлог
+    needs: [build, tag]
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Скачать артефакты сборки
+        uses: actions/download-artifact@v4
+        with:
+          name: YawaChatHub-${{ needs.build.outputs.version }}
+          path: release-files
+
+      - name: Сформировать ченжлог v${{ needs.build.outputs.version }}
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          bash scripts/changelog.sh "$VERSION" > RELEASE_NOTES.md
+          printf '\n---\n\n**Файлы:** `YawaChatHub.exe` — portable x64, `YawaChatHub-Setup.exe` — установщик Windows x64.\n' >> RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Обновить CHANGELOG.md и VERSION в репозитории
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          NEXT: ${{ needs.build.outputs.next }}
+        run: |
+          if grep -q "^## YawaChatHub v${VERSION}$" CHANGELOG.md; then
+            echo "Раздел v$VERSION уже есть"
+          else
+            section="$(mktemp)"
+            result="$(mktemp)"
+            bash scripts/changelog.sh "$VERSION" > "$section"
+            head -n 1 CHANGELOG.md > "$result"
+            printf '\n' >> "$result"
+            cat "$section" >> "$result"
+            tail -n +2 CHANGELOG.md >> "$result"
+            mv "$result" CHANGELOG.md
+          fi
+
+          # VERSION всегда указывает на следующий кандидат релиза:
+          # 1.0.0 → 1.0.1 → … → 1.0.9 → 1.1.0 → … → 1.9.9 → 2.0.0
+          node scripts/bump-version.mjs --set "$NEXT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md VERSION desktop/package.json
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md и VERSION без изменений"
+          else
+            git commit -m "docs: ченжлог v$VERSION, следующая версия $NEXT [skip ci]"
+            BRANCH="${GITHUB_REF_NAME}"
+            if [ "${{ github.ref_type }}" = "tag" ] || [ -z "$BRANCH" ]; then BRANCH="main"; fi
+            git push origin "HEAD:$BRANCH"
+          fi
+
+      - name: Показать файлы релиза
+        run: ls -la release-files
+
+      - name: Опубликовать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: "YawaChatHub v${{ needs.build.outputs.version }}"
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            release-files/YawaChatHub.exe
+            release-files/YawaChatHub-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
