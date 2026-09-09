@@ -1,0 +1,635 @@
+// Мост между интерфейсом и desktop-оболочкой (Electron preload → window.sp).
+// На сайте (без моста) работает симуляция; в приложении — реальные каналы и SAPI.
+import { useCallback, useEffect, useRef, useState } from "react";
+import { makeMessage, makeSys, PLATFORMS } from "./core";
+import type { ChatMsg, PlatformId } from "./core";
+import type { ModerateAction } from "@/components/app/ModerateMenu";
+import type { OverlayConfig } from "./widget";
+
+export type UiMode = "site" | "app" | "overlay" ;
+
+export interface BridgeChannel {
+  id: string;
+  platform: PlatformId;
+  channelId: string;
+  status: "online" | "offline" | "error" | "connecting";
+  /** текущий онлайн канала; для DonationAlerts — общая сумма донатов за стрим. */
+  viewers?: number | null;
+  /** Валюта суммы для канала DonationAlerts. */
+  currency?: string;
+}
+
+/* ---------------- чат-бот (Twitch + VK) ---------------- */
+
+export type BotPlatform = "twitch" | "vk";
+
+export interface BotConnectionStatus {
+  platform: BotPlatform;
+  status: "offline" | "connecting" | "online" | "error";
+  error: string;
+  connectedAt: number;
+  followCount: number;
+  lastEvent: string;
+  lastEventAt: number;
+  /** Каналы, найденные автоматически после авторизации (ник вводить не нужно). */
+  channels: string[];
+  botAccount: string;
+  /** Есть ли сохранённый OAuth-токен для этой площадки. */
+  authorized: boolean;
+  /** Имя авторизованного аккаунта (бота), если известно. */
+  account?: string;
+  /** Ссылка на сайт, куда вернётся браузер после авторизации. */
+  oauthUrl?: string;
+}
+
+export interface BotCommand {
+  id: string;
+  trigger: string;
+  response: string;
+  cooldownSec: number;
+  lastRun: number;
+}
+
+export interface BotTimeoutOption { id: string; label: string; seconds: number; }
+
+export interface DonationSummary {
+  enabled: boolean;
+  currency: string;
+  total: number;
+  webhookUrl: string;
+  configured: boolean;
+}
+
+export interface DonationEvent {
+  amount: number;
+  currency: string;
+  username: string;
+  message: string;
+  total: number;
+}
+
+export interface SpBridge {
+  mode: "app" | "overlay" ;
+  platform: string;
+  onChat: (cb: (m: ChatMsg) => void) => void;
+  onChannels: (cb: (list: BridgeChannel[]) => void) => void;
+  getChannels: () => Promise<BridgeChannel[]>;
+  addChannel: (platform: PlatformId, channelId: string) => void;
+  removeChannel: (platform: PlatformId, channelId: string) => void;
+  diagnoseNet?: () => void;
+  widgetUrl: () => Promise<string>;
+  widgetInfo: () => Promise<{ port: number; token: string; url: string }>;
+  widgetTest: (msg: ChatMsg) => void;
+  /** Живое оформление OBS-виджета: применяется без смены ссылки. */
+  widgetConfig?: (payload: unknown) => void;
+  onWidgetClients: (cb: (n: number) => void) => void;
+  /** Статус озвучки в OBS: played | blocked | no-voice | no-client | error. */
+  onObsTts?: (cb: (msg: ObsTtsStatus) => void) => void;
+  onHotkey: (cb: (action: string) => void) => void;
+  settings: {
+    get: () => Promise<Record<string, unknown>>;
+    patch: (patch: Record<string, unknown>) => void;
+    onChange: (cb: (s: Record<string, unknown>) => void) => void;
+  };
+  hotkeys: {
+    apply: (map: Record<string, string>) => void;
+    /** Сочетания, которые не удалось зарегистрировать: заняты другой программой. */
+    conflicts?: () => Promise<Array<{ action: string; accelerator: string; error?: string }>>;
+    onConflicts?: (cb: (list: Array<{ action: string; accelerator: string }>) => void) => void;
+  };
+  window: {
+    minimize: () => void;
+    hideToTray: () => void;
+    toggleMaximize: () => void;
+    close: () => void;
+    onMaximize: (cb: (v: boolean) => void) => void;
+    isMaximized: () => Promise<boolean>;
+  };
+  tts: {
+    speak: (p: { text: string; rate: number; volume: number; voice?: string }) => string;
+    skip: () => void;
+    stopAll: () => void;
+    /** engine: "edge" — онлайн-голоса Edge (только русские), "sapi" — системные Windows */
+    voices: () => Promise<Array<{ name: string; engine: "sapi" | "edge"; label?: string; gender?: string }>>;
+    onEnd: (cb: (id: string) => void) => void;
+    /** Edge TTS: главный процесс прислал готовый MP3 — его играет окно. */
+    onAudio?: (cb: (p: { id: string; audioBase64: string; mime: string; volume?: number }) => void) => void;
+    /** Остановить текущее воспроизведение в окне (skip / stopAll). */
+    onStop?: (cb: () => void) => void;
+    /** Сообщить главному процессу, что фраза доиграла. */
+    audioDone?: (id: string) => void;
+  };
+  overlay: {
+    get: () => Promise<OverlayConfig>;
+    set: (cfg: Partial<OverlayConfig>) => void;
+    onChange: (cb: (o: OverlayConfig) => void) => void;
+  };
+  /* чат-бот: статусы подключений, команды, модерация, DonationAlerts */
+  bot?: {
+    status: () => Promise<BotConnectionStatus[]>;
+    save: (patch: Record<string, unknown>) => Promise<boolean>;
+    connect: (platform: BotPlatform) => void;
+    disconnect: (platform: BotPlatform) => void;
+    commands: (platform: BotPlatform) => Promise<BotCommand[]>;
+    addCommand: (platform: BotPlatform, command: { trigger: string; response: string; cooldownSec?: number }) => Promise<BotCommand>;
+    removeCommand: (platform: BotPlatform, id: string) => void;
+    send: (platform: BotPlatform, channel: string, text: string) => Promise<boolean>;
+    moderate: (payload: { platform: BotPlatform; author?: string; login?: string; text?: string; action: ModerateAction; seconds?: number }) => Promise<{ ok: boolean; error?: string }>;
+    timeouts: (platform: BotPlatform) => Promise<BotTimeoutOption[]>;
+    daSummary: () => Promise<DonationSummary>;
+    daReset: () => void;
+    onStatus: (cb: (list: BotConnectionStatus[]) => void) => () => void;
+    onDonate: (cb: (d: DonationEvent) => void) => () => void;
+    /** Валюта донатов и итог за стрим — канал DonationAlerts в списке площадок. */
+    donation: () => Promise<{ currency: string; total: number; connected: boolean; configured?: boolean; account?: string }>;
+    setDonationCurrency: (currency: string) => void;
+  };
+  /* Авторизация по площадкам: открывает браузер по умолчанию.
+     Токен приходит обратно на сайт (redirect URL) и оттуда пересылается
+     в приложение локальным сервером — интерфейс только опрашивает статус. */
+  oauth?: {
+    twitch: () => Promise<{ ok: boolean; error?: string; url?: string }>;
+    vk: () => Promise<{ ok: boolean; error?: string; url?: string }>;
+    /** Ручной ввод токена (запасной путь авторизации). */
+    submit: (platform: BotPlatform, token: string) => Promise<boolean>;
+    /** Раз_authorизация: удалить токен площадки. */
+    revoke: (platform: BotPlatform) => Promise<boolean>;
+    /** Текущий статус авторизации по площадкам. */
+    state: () => Promise<Array<{ platform: BotPlatform; authorized: boolean; account?: string; channel?: string }>>;
+    /** Пришёл токен (страница сайта переслала его в приложение). */
+    onToken: (cb: (p: { platform: BotPlatform; account?: string; channel?: string }) => void) => () => void;
+  };
+}
+
+export function getSp(): SpBridge | null {
+  if (typeof window === "undefined") return null;
+  return (window as unknown as { sp?: SpBridge }).sp ?? null;
+}
+
+export const isDesktop = () => !!getSp();
+
+export function getUiMode(): UiMode {
+  const sp = getSp();
+  if (sp) return sp.mode;
+  if (typeof location !== "undefined") {
+if (location.hash.startsWith("#/overlay")) return "overlay";
+    if (location.hash.startsWith("#/app")) return "app";
+  }
+  return "site";
+}
+
+/* ================= источник сообщений ================= */
+
+/** Что ответил браузерный источник OBS на попытку озвучки. */
+export interface ObsTtsStatus {
+  type?: string;
+  id?: string;
+  state?: "played" | "blocked" | "no-voice" | "no-client" | "error" | "unblocked";
+  error?: string;
+}
+
+export type ChStatus = "online" | "offline" | "error" | "connecting";
+
+export interface Channel {
+  id: string;
+  platform: PlatformId;
+  channelId: string;
+  status: ChStatus;
+  /** онлайн (число зрителей); для DonationAlerts — общая сумма донатов за стрим. */
+  viewers?: number | null;
+  /** Валюта суммы DonationAlerts. */
+  currency?: string;
+  timer?: number;
+}
+
+const SIM_DEFAULTS: Channel[] = [
+  { id: "c1", platform: "twitch", channelId: "yawaside", status: "online", viewers: 1284 },
+  { id: "c2", platform: "youtube", channelId: "LofiRadio24/7", status: "online", viewers: 15920 },
+  { id: "c3", platform: "kick", channelId: "cyber_arena", status: "online", viewers: 342 },
+  { id: "c4", platform: "tiktok", channelId: "@yawa.live", status: "offline", timer: 24 },
+  { id: "c5", platform: "vk", channelId: "vklive.cyber", status: "error", timer: 12 },
+  // DonationAlerts — обычная площадка; до ввода secret token показывает «Не настроено».
+  { id: "donation:donationalerts", platform: "donation", channelId: "DonationAlerts", status: "offline", viewers: null, currency: "RUB" },
+];
+
+/** Симуляция онлайна: стартовое значение при подключении и плавный дрейф раз в несколько секунд. */
+const SIM_VIEWERS_BASE: Record<PlatformId, number> = { twitch: 1200, youtube: 9000, kick: 350, tiktok: 2600, vk: 180, donation: 0 };
+function simInitialViewers(platform: PlatformId): number {
+  const base = SIM_VIEWERS_BASE[platform];
+  return Math.round(base * (0.6 + Math.random() * 0.8));
+}
+function simDriftViewers(v: number | null | undefined, platform: PlatformId): number {
+  if (typeof v !== "number") return simInitialViewers(platform);
+  const delta = Math.round(v * (Math.random() - 0.47) * 0.06);
+  return Math.max(1, v + delta);
+}
+
+export function useChatSource(onMsg: (m: ChatMsg) => void) {
+  const sp = getSp();
+  const [channels, setChannels] = useState<Channel[]>(sp ? [] : SIM_DEFAULTS);
+  const onMsgRef = useRef(onMsg);
+  onMsgRef.current = onMsg;
+  const channelsRef = useRef(channels);
+  channelsRef.current = channels;
+
+  useEffect(() => {
+    if (sp) {
+      sp.onChat((m) => onMsgRef.current(m));
+      sp.onChannels((list) => setChannels(list));
+      sp.getChannels().then((list) => {
+        if (list.length) setChannels(list);
+      });
+      return;
+    }
+    /* ---------- site mode: симуляция ---------- */
+    let alive = true;
+    let tick = 0;
+    const iv = window.setInterval(() => {
+      if (!alive) return;
+      tick += 1;
+      const drift = tick % 4 === 0; // онлайн меняется раз в 4 секунды
+      const cur = channelsRef.current;
+      let changed = false;
+      const next = cur.map((c) => {
+        if (c.timer === undefined) {
+          if (drift && c.status === "online") {
+            changed = true;
+            return { ...c, viewers: simDriftViewers(c.viewers, c.platform) };
+          }
+          return c;
+        }
+        changed = true;
+        const t = c.timer - 1;
+        if (c.status === "offline" && t <= 0) {
+          onMsgRef.current(makeSys(`Трансляция началась: ${c.channelId}`, c.platform));
+          return { ...c, status: "online" as const, timer: 42, viewers: simInitialViewers(c.platform) };
+        }
+        if (c.status === "online" && t <= 0) {
+          if (c.id === "c3") {
+            onMsgRef.current(makeSys(`Трансляция завершена: ${c.channelId}`, c.platform));
+            return { ...c, status: "offline" as const, timer: 55, viewers: null };
+          }
+          onMsgRef.current(makeSys(`Соединение потеряно: ${c.channelId}. Повтор через 12 с`, c.platform));
+          return { ...c, status: "error" as const, timer: 12, viewers: null };
+        }
+        if (c.status === "error" && t <= 0) return { ...c, status: "connecting" as const, timer: 2, viewers: null };
+        if (c.status === "connecting" && t <= 0) {
+          onMsgRef.current(
+            makeSys(`Канал подключён: ${PLATFORMS[c.platform].label} / ${c.channelId}`, c.platform)
+          );
+          return { ...c, status: "online" as const, timer: 46, viewers: simInitialViewers(c.platform) };
+        }
+        const viewers = drift && c.status === "online" ? simDriftViewers(c.viewers, c.platform) : c.viewers;
+        return { ...c, timer: t, viewers };
+      });
+      /* Обновляем состояние ТОЛЬКО если изменилось то, что реально видно:
+         статус канала или число зрителей. Служебный `timer` тикает каждую
+         секунду, но на экран не выводится — если учитывать и его, всё окно
+         перерисовывалось ежесекундно и интерфейс мигал. */
+      const visible = next.some((c, i) => {
+        const prev = cur[i];
+        return !prev ||
+          prev.status !== c.status ||
+          prev.viewers !== c.viewers ||
+          prev.channelId !== c.channelId ||
+          prev.platform !== c.platform;
+      });
+      if (visible) setChannels(next);
+    }, 1000);
+
+    let to = 0;
+    const loop = () => {
+      if (!alive) return;
+      to = window.setTimeout(() => {
+        if (!alive) return;
+        const online = channelsRef.current.filter((c) => c.status === "online");
+        if (online.length) {
+          const ch = online[Math.floor(Math.random() * online.length)];
+          onMsgRef.current(makeMessage(ch.platform));
+        }
+        loop();
+      }, 900 + Math.random() * 2100);
+    };
+    loop();
+
+    return () => {
+      alive = false;
+      window.clearInterval(iv);
+      window.clearTimeout(to);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const addChannel = useCallback(
+    (platform: PlatformId, channelId: string) => {
+      if (sp) {
+        sp.addChannel(platform, channelId);
+        return;
+      }
+      setChannels((c) => [
+        ...c,
+        { id: `u${Date.now()}`, platform, channelId, status: "connecting" as const, timer: 2 },
+      ]);
+    },
+    [sp]
+  );
+
+  const removeChannel = useCallback(
+    (id: string) => {
+      if (sp) {
+        const ch = channelsRef.current.find((c) => c.id === id);
+        if (ch) sp.removeChannel(ch.platform, ch.channelId);
+        return;
+      }
+      setChannels((c) => c.filter((x) => x.id !== id));
+    },
+    [sp]
+  );
+
+  return { channels, addChannel, removeChannel, real: !!sp };
+}
+
+/* ================= сохраняемые настройки ================= */
+
+/**
+ * Объектная настройка, которая живёт в settings.json рядом с exe (desktop)
+ * или в localStorage (браузер). Значение сохраняется СРАЗУ при изменении.
+ */
+export function usePersisted<T extends object>(key: string, initial: T): [T, (v: T) => void] {
+  const sp = getSp();
+  // Stable first render for Next.js hydration; saved values load after mount.
+  const [value, setValue] = useState<T>(initial);
+  useEffect(() => {
+    let alive = true;
+    if (sp) {
+      sp.settings.get().then(s => {
+        const saved = s?.[key];
+        if (alive && saved && typeof saved === "object" && !Array.isArray(saved))
+          setValue(cur => ({ ...cur, ...saved as object } as T));
+      });
+      return () => { alive = false; };
+    }
+    const load = () => {
+      try {
+        const raw = localStorage.getItem(`yawa:${key}`);
+        if (raw) {
+          const saved: unknown = JSON.parse(raw);
+          if (saved && typeof saved === "object" && !Array.isArray(saved)) setValue({ ...initial, ...saved } as T);
+        }
+      } catch { /* Keep defaults if stored data is unavailable. */ }
+    };
+    load();
+    const onStorage = (e: StorageEvent) => { if (e.key === `yawa:${key}`) load(); };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, sp]);
+
+  const update = useCallback(
+    (v: T) => {
+      setValue(v);
+      if (sp) sp.settings.patch({ [key]: v });
+      else {
+        try {
+          localStorage.setItem(`yawa:${key}`, JSON.stringify(v));
+        } catch { /* noop */ }
+      }
+    },
+    [key, sp]
+  );
+
+  return [value, update];
+}
+
+/**
+ * Простая настройка (число / строка / флаг) верхнего уровня settings.json.
+ * Также сохраняется мгновенно — кнопка «Сохранить» не нужна.
+ */
+export function useSetting<T>(key: string, initial: T): [T, (v: T) => void] {
+  const sp = getSp();
+  const [value, setValue] = useState<T>(initial);
+  useEffect(() => {
+    let alive = true;
+    if (sp) {
+      sp.settings.get().then(s => { if (alive && s?.[key] !== undefined) setValue(s[key] as T); });
+      return () => { alive = false; };
+    }
+    const load = () => {
+      try { const raw = localStorage.getItem(`yawa:${key}`); if (raw !== null) setValue(JSON.parse(raw) as T); }
+      catch { /* Keep defaults if storage cannot be read. */ }
+    };
+    load();
+    const onStorage = (e: StorageEvent) => { if (e.key === `yawa:${key}`) load(); };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [key, sp]);
+
+  const update = useCallback(
+    (v: T) => {
+      setValue(v);
+      if (sp) sp.settings.patch({ [key]: v });
+      else {
+        try {
+          localStorage.setItem(`yawa:${key}`, JSON.stringify(v));
+        } catch { /* noop */ }
+      }
+    },
+    [key, sp]
+  );
+
+  return [value, update];
+}
+
+/** URL и статистика локального сервера виджета */
+export function useWidgetInfo(): { port: number; token: string; clients: number; url: string } {
+  const sp = getSp();
+  const [info, setInfo] = useState({
+    port: 47823,
+    token: "sp_demo_token",
+    clients: 0,
+    url: "",
+  });
+
+  useEffect(() => {
+    if (!sp) return;
+    sp.widgetInfo().then((i) =>
+      setInfo((cur) => ({ ...cur, port: i.port, token: i.token, url: i.url || cur.url }))
+    );
+    sp.onWidgetClients((n) => setInfo((cur) => ({ ...cur, clients: n })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return info;
+}
+
+/* подписка на глобальные горячие клавиши desktop-версии */
+export function useHotkeys(handlers: Record<string, () => void>) {
+  const ref = useRef(handlers);
+  ref.current = handlers;
+  useEffect(() => {
+    const sp = getSp();
+    if (!sp) return;
+    sp.onHotkey((action) => {
+      const fn = ref.current[action];
+      if (fn) fn();
+    });
+  }, []);
+}
+
+/** состояние «окно развёрнуто на весь экран» (desktop) */
+export function useWindowMaximized(): boolean {
+  const sp = getSp();
+  const [max, setMax] = useState(false);
+  useEffect(() => {
+    if (!sp) return;
+    sp.window.isMaximized().then(setMax).catch(() => {});
+    sp.window.onMaximize((v) => setMax(v));
+  }, [sp]);
+  return max;
+}
+
+/**
+ * Модерация из ленты: клик по нику → меню с таймаутом/баном.
+ * Период подбирается в интерфейсе по площадке; VK поддерживает только бан.
+ * В браузере (сайт) показываем подсказку — действие выполняет desktop-сборка.
+ */
+export function useModerate(toast: (t: string) => void) {
+  const sp = getSp();
+  const moderate = useCallback(
+    async (m: ChatMsg, action: ModerateAction, seconds?: number) => {
+      if (!sp?.bot) {
+        toast("Модерация доступна в desktop-версии (чат-бот)");
+        return;
+      }
+      if (m.platform !== "twitch" && m.platform !== "vk") {
+        toast(`Модерация недоступна для площадки ${m.platform}`);
+        return;
+      }
+      const res = await sp.bot.moderate({
+        platform: m.platform as BotPlatform,
+        author: m.author,
+        text: m.text,
+        action,
+        seconds,
+      });
+      if (!res.ok) {
+        toast(res.error || "Ошибка модерации");
+        return;
+      }
+      const label: Record<string, string> = {
+        ban: `${m.author} забанен`,
+        unban: `${m.author} разбанен`,
+        timeout: `${m.author} в таймауте (${Math.round((seconds ?? 0) / 60) || 1} мин)`,
+        delete: "Сообщение удалено",
+        clear: "Чат очищен",
+        emoteonly: "Только смайлы",
+        slow: "Медленный режим",
+        followers: "Режим подписчиков",
+        subscribers: "Режим сабов",
+      };
+      toast(label[action] ?? "Готово");
+    },
+    [sp, toast]
+  );
+  return moderate;
+}
+
+/** Список доступных периодов таймаута по площадке — общий для ленты и настроек. */
+export const TIMEOUT_OPTIONS: Record<string, Array<{ id: string; label: string; seconds: number }>> = {
+  twitch: [
+    { id: "60", label: "1 минута", seconds: 60 },
+    { id: "300", label: "5 минут", seconds: 300 },
+    { id: "600", label: "10 минут", seconds: 600 },
+    { id: "1800", label: "30 минут", seconds: 1800 },
+    { id: "1d", label: "1 день", seconds: 86400 },
+    { id: "1w", label: "1 неделя", seconds: 604800 },
+  ],
+  vk: [
+    { id: "600", label: "10 минут", seconds: 600 },
+    { id: "1d", label: "1 день", seconds: 86400 },
+  ],
+};
+
+/* ================= DonationAlerts: валюта канала ================= */
+
+/** Валюта донатов — отдельная настройка канала DonationAlerts. */
+export function useDonationCurrency(): [string, (v: string) => void] {
+  const [currency, setCurrency] = useSetting<string>("donationCurrency", "RUB");
+  const update = useCallback(
+    (v: string) => {
+      setCurrency(v);
+      const sp = getSp();
+      sp?.bot?.setDonationCurrency(v);
+    },
+    [setCurrency]
+  );
+  return [currency, update];
+}
+
+/* ================= Авторизация чат-бота по площадкам ================= */
+
+export interface BotAuthState {
+  platform: BotPlatform;
+  authorized: boolean;
+  account?: string;
+  channel?: string;
+}
+
+/**
+ * Авторизация бота по площадкам. Канал вводить не нужно: после входа через
+ * браузер по умолчанию приложение само узнаёт аккаунт и канал, а статус
+ * обновляется событием `sp:oauth-token` из главного процесса.
+ */
+export function useBotAuth(toast: (t: string) => void) {
+  const sp = getSp();
+  const [state, setState] = useState<BotAuthState[]>([]);
+  const [busy, setBusy] = useState<string>("");
+
+  const refresh = useCallback(() => {
+    if (!sp?.oauth) {
+      setState([
+        { platform: "twitch", authorized: false },
+        { platform: "vk", authorized: false },
+      ]);
+      return;
+    }
+    sp.oauth.state().then((list) => setState(list)).catch(() => setState([]));
+  }, [sp]);
+
+  useEffect(() => {
+    refresh();
+    if (!sp?.oauth) return;
+    const off = sp.oauth.onToken(() => {
+      refresh();
+      toast("Бот подключён — ник канала получен автоматически");
+    });
+    return off;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sp]);
+
+  const authorize = useCallback(
+    async (platform: BotPlatform) => {
+      if (!sp?.oauth) {
+        toast("Авторизация доступна в desktop-версии");
+        return;
+      }
+      setBusy(platform);
+      const res = platform === "twitch" ? await sp.oauth.twitch() : await sp.oauth.vk();
+      setBusy("");
+      if (!res.ok && res.error !== "Авторизация отменена") toast(res.error || "Авторизация не выполнена");
+    },
+    [sp, toast]
+  );
+
+  const revoke = useCallback(
+    async (platform: BotPlatform) => {
+      if (!sp?.oauth) return;
+      await sp.oauth.revoke(platform);
+      refresh();
+      toast("Бот отключён от площадки");
+    },
+    [sp, refresh, toast]
+  );
+
+  return { state, busy, authorize, revoke, refresh };
+}
