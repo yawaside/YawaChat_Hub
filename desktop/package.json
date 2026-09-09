@@ -1,7 +1,7 @@
 {
   "name": "yawachathub",
   "productName": "YawaChatHub",
-  "version": "1.1.9",
+  "version": "1.3.4",
   "description": "Единая лента сообщений со стримов (Twitch / YouTube Live / VK Video Live / Kick / TikTok) с озвучкой, OBS-виджетом и игровым оверлеем. Portable exe и установщик Windows x64.",
   "main": "electron/main.js",
   "type": "commonjs",
